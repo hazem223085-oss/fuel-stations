@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>أقرب محطة وقود</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;800&display=swap" rel="stylesheet">
+<style>
+  :root{--bg:#0f1418;--panel:#161d23;--line:#26313a;--fg:#eef2f4;--mute:#8fa0ab;--accent:#ffb020;--ok:#3ddc97;}
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font-family:'Cairo',system-ui,sans-serif}
+  #map{position:absolute;inset:0}
+  .panel{position:absolute;z-index:5;background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:0 10px 30px #0008}
+  #list{top:12px;right:12px;width:min(340px,calc(100% - 24px));max-height:calc(100% - 24px);display:flex;flex-direction:column;overflow:hidden}
+  #head{padding:12px 14px;border-bottom:1px solid var(--line)}
+  #head h1{margin:0;font-size:18px;font-weight:800}
+  #status{margin:4px 0 0;font-size:13px;color:var(--mute)}
+  #btns{display:flex;gap:8px;padding:10px 14px;border-bottom:1px solid var(--line)}
+  button{font:inherit;font-size:13px;font-weight:600;color:var(--fg);background:#1f2a32;border:1px solid var(--line);border-radius:10px;padding:8px 10px;cursor:pointer;flex:1}
+  button:hover{border-color:var(--accent)}
+  button.on{background:var(--accent);color:#1a1200;border-color:var(--accent)}
+  button:focus-visible,.item:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  #items{overflow:auto;margin:0;padding:6px;list-style:none}
+  .item{display:flex;gap:10px;align-items:center;padding:9px 10px;border-radius:10px;cursor:pointer}
+  .item:hover,.item.sel{background:#1f2a32}
+  .rank{flex:none;width:28px;height:28px;border-radius:50%;background:#26313a;display:grid;place-items:center;font-weight:800;font-size:13px}
+  .item.first .rank{background:var(--ok);color:#06231a}
+  .meta{min-width:0;flex:1}
+  .name{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .sub{font-size:12px;color:var(--mute)}
+  .dist{flex:none;font-weight:800;font-size:14px;font-variant-numeric:tabular-nums;color:var(--accent)}
+  .pin{background:var(--accent);color:#1a1200;font:800 12px 'Cairo',sans-serif;border-radius:999px;padding:2px 8px;border:2px solid #fff;white-space:nowrap;transform:translateY(-6px)}
+  .pin.first{background:var(--ok);color:#06231a}
+  .me{width:18px;height:18px;border-radius:50%;background:#3b82f6;border:3px solid #fff;box-shadow:0 0 0 8px #3b82f655}
+  @media (max-width:600px){
+    #list{top:auto;bottom:0;right:0;left:0;width:100%;max-height:46%;border-radius:14px 14px 0 0;padding-bottom:env(safe-area-inset-bottom,0)}
+  }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<section class="panel" id="list" aria-live="polite">
+  <div id="head"><h1>أقرب محطات الوقود</h1><p id="status">بنحدد موقعك…</p></div>
+  <div id="btns">
+    <button id="locate" type="button">موقعي الحالي</button>
+    <button id="pick" type="button">اختار موقع على الخريطة</button>
+  </div>
+  <ul id="items"></ul>
+</section>
+
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script>
+const DEFAULT = {lat:30.5877, lon:31.5020}; // الزقازيق
+const RADIUS = 6000;                          // متر
+const OVERPASS = ['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter','https://overpass.private.coffee/api/interpreter'];
+
+const $ = id => document.getElementById(id);
+const map = new maplibregl.Map({
+  container:'map',
+  style:'https://tiles.openfreemap.org/styles/liberty',
+  center:[DEFAULT.lon,DEFAULT.lat], zoom:15.8, pitch:65, bearing:-20, maxPitch:80
+});
+map.addControl(new maplibregl.NavigationControl({visualizePitch:true}),'top-left');
+
+let user = null, stations = [], markers = [], meMarker = null, picking = false, selected = 0, ready = false, runId = 0;
+
+const emptyFC = {type:'FeatureCollection',features:[]};
+map.on('load',()=>{
+  map.addSource('towers',{type:'geojson',data:emptyFC});
+  map.addSource('route',{type:'geojson',data:emptyFC});
+  map.addLayer({id:'route-casing',type:'line',source:'route',layout:{'line-cap':'round','line-join':'round'},paint:{'line-color':'#0b1a2b','line-width':10,'line-opacity':.8}});
+  map.addLayer({id:'route-line',type:'line',source:'route',layout:{'line-cap':'round','line-join':'round'},paint:{'line-color':'#3b82f6','line-width':6}});
+  map.addLayer({id:'towers',type:'fill-extrusion',source:'towers',paint:{
+    'fill-extrusion-color':['get','color'],'fill-extrusion-height':['get','h'],'fill-extrusion-base':0,'fill-extrusion-opacity':.95}});
+  ready = true;
+  if(pendingDraw){ pendingDraw=false; mapDraw(); }
+});
+map.on('error',e=>{ if(!ready) $('status').textContent='مشكلة في تحميل الخريطة، تأكد من النت وحدّث الصفحة'; console.error(e&&e.error||e); });
+let pendingDraw = false;
+locate(); // مش محتاجين نستنى الخريطة عشان نحدد الموقع ونجيب المحطات
+
+map.on('click',e=>{
+  if(!picking) return;
+  picking = false; $('pick').classList.remove('on'); map.getCanvas().style.cursor='';
+  setUser(e.lngLat.lat,e.lngLat.lng,'الموقع اللي اخترته');
+});
+
+$('locate').onclick = locate;
+$('pick').onclick = ()=>{
+  picking = !picking;
+  $('pick').classList.toggle('on',picking);
+  map.getCanvas().style.cursor = picking ? 'crosshair' : '';
+  if(picking) $('status').textContent = 'دوس على الخريطة في مكانك';
+};
+
+function locate(){
+  $('status').textContent = 'بنحدد موقعك…';
+  if(!navigator.geolocation){ return fallback('المتصفح مش بيدعم تحديد الموقع'); }
+  navigator.geolocation.getCurrentPosition(
+    p => setUser(p.coords.latitude,p.coords.longitude,'موقعك الحالي'),
+    ()=> fallback('مقدرناش نوصل لموقعك. فعّل الـ GPS أو اختار موقع يدوي'),
+    {enableHighAccuracy:true,timeout:10000,maximumAge:30000}
+  );
+}
+function fallback(msg){ setUser(DEFAULT.lat,DEFAULT.lon,'وسط الزقازيق (افتراضي)',msg); }
+
+function setUser(lat,lon,label,note){
+  user = {lat,lon};
+  if(meMarker) meMarker.remove();
+  const el = document.createElement('div'); el.className='me';
+  meMarker = new maplibregl.Marker({element:el}).setLngLat([lon,lat]).addTo(map);
+  map.flyTo({center:[lon,lat],zoom:15.8,pitch:65,bearing:-20,duration:1800});
+  $('status').textContent = (note ? note+' — ' : '')+'بندور على المحطات…';
+  loadStations(lat,lon,label);
+}
+
+async function overpass(lat,lon){
+  const q = `[out:json][timeout:25];(node["amenity"="fuel"](around:${RADIUS},${lat},${lon});way["amenity"="fuel"](around:${RADIUS},${lat},${lon}););out center tags;`;
+  let err;
+  for(const url of OVERPASS){
+    try{
+      const r = await fetch(url+'?data='+encodeURIComponent(q));
+      if(!r.ok) throw new Error(r.status);
+      return (await r.json()).elements;
+    }catch(e){ err = e; console.error(url,e); }
+  }
+  throw err;
+}
+
+function hav(a,b,c,d){
+  const R=6371000,t=x=>x*Math.PI/180,dl=t(c-a),dn=t(d-b);
+  const h=Math.sin(dl/2)**2+Math.cos(t(a))*Math.cos(t(c))*Math.sin(dn/2)**2;
+  return 2*R*Math.asin(Math.sqrt(h));
+}
+function fmt(m){ return m<1000 ? Math.round(m)+' م' : (m/1000).toFixed(1)+' كم'; }
+
+async function loadStations(lat,lon,label){
+  const my = ++runId;
+  let els;
+  try{ els = await overpass(lat,lon); }
+  catch(e){ $('status').textContent='تعذر تحميل بيانات المحطات. جرّب تاني بعد شوية.'; return; }
+  if(my!==runId) return;
+  stations = els.map(e=>{
+    const la = e.lat ?? e.center?.lat, lo = e.lon ?? e.center?.lon, t = e.tags||{};
+    return {lat:la,lon:lo,name:t['name:ar']||t.name||t.brand||'محطة وقود',brand:t.brand||t.operator||'',air:hav(lat,lon,la,lo)};
+  }).filter(s=>s.lat!=null).sort((a,b)=>a.air-b.air).slice(0,10);
+  if(!stations.length){ $('status').textContent='مفيش محطات في دايرة '+(RADIUS/1000)+' كم'; $('items').innerHTML=''; draw(); return; }
+
+  // المسافة الفعلية على الطرق لأقرب 3 محطات (OSRM)، وبعدها نرتب على أساسها
+  await Promise.all(stations.slice(0,3).map(async s=>{
+    try{
+      const r = await fetch(`https://router.project-osrm.org/route/v1/driving/${lon},${lat};${s.lon},${s.lat}?overview=full&geometries=geojson`);
+      const j = await r.json(); const rt = j.routes?.[0];
+      if(rt){ s.road = rt.distance; s.mins = rt.duration/60; s.geom = rt.geometry; }
+    }catch(e){}
+  }));
+  if(my!==runId) return;
+  stations.forEach(s=>s.d = s.road ?? s.air);
+  const top = stations.slice(0,3).sort((a,b)=>a.d-b.d);
+  stations = top.concat(stations.slice(3));
+  selected = 0;
+  $('status').textContent = label+' — أقرب محطة على بعد '+fmt(stations[0].d)+(stations[0].road?' بالطريق':' (خط مستقيم)');
+  draw();
+}
+
+function circle(lon,lat,r,n=14){
+  const pts=[]; for(let i=0;i<=n;i++){const a=i/n*2*Math.PI;
+    pts.push([lon+(r*Math.cos(a))/(111320*Math.cos(lat*Math.PI/180)),lat+(r*Math.sin(a))/110540]);}
+  return pts;
+}
+
+function draw(){
+  renderList();
+  if(!ready){ pendingDraw = true; return; }
+  mapDraw();
+}
+function mapDraw(){
+  markers.forEach(m=>m.remove()); markers=[];
+  map.getSource('towers').setData({type:'FeatureCollection',features:stations.map((s,i)=>({
+    type:'Feature',properties:{h:i===0?140:80,color:i===0?'#3ddc97':'#ffb020'},
+    geometry:{type:'Polygon',coordinates:[circle(s.lon,s.lat,11)]}}))});
+  stations.forEach((s,i)=>{
+    const el=document.createElement('div'); el.className='pin'+(i===0?' first':''); el.textContent=(i+1)+' · '+fmt(s.d);
+    el.style.cursor='pointer'; el.onclick=()=>select(i);
+    markers.push(new maplibregl.Marker({element:el,anchor:'bottom',offset:[0,-(i===0?140:80)]}).setLngLat([s.lon,s.lat]).addTo(map));
+  });
+  showRoute(0);
+}
+function renderList(){
+  $('items').innerHTML = stations.map((s,i)=>`
+    <li class="item${i===0?' first':''}" tabindex="0" data-i="${i}">
+      <span class="rank">${i+1}</span>
+      <span class="meta"><div class="name"></div><div class="sub">${s.road?(Math.max(1,Math.round(s.mins))+' دقيقة بالعربية'):'خط مستقيم'}</div></span>
+      <span class="dist">${fmt(s.d)}</span>
+    </li>`).join('');
+  [...$('items').children].forEach((li,i)=>{
+    li.querySelector('.name').textContent = stations[i].name + (stations[i].brand && stations[i].brand!==stations[i].name ? ' · '+stations[i].brand : '');
+    li.onclick = ()=>select(i);
+    li.onkeydown = e=>{ if(e.key==='Enter'||e.key===' '){e.preventDefault();select(i);} };
+  });
+}
+
+async function select(i){
+  selected = i;
+  const s = stations[i];
+  [...$('items').children].forEach((li,k)=>li.classList.toggle('sel',k===i));
+  map.flyTo({center:[s.lon,s.lat],zoom:17,pitch:68,duration:1400});
+  if(!s.geom && user){
+    try{
+      const r = await fetch(`https://router.project-osrm.org/route/v1/driving/${user.lon},${user.lat};${s.lon},${s.lat}?overview=full&geometries=geojson`);
+      const rt = (await r.json()).routes?.[0];
+      if(rt){ s.road=rt.distance; s.mins=rt.duration/60; s.geom=rt.geometry; }
+    }catch(e){}
+  }
+  showRoute(i);
+}
+function showRoute(i){
+  const s = stations[i];
+  map.getSource('route').setData(s?.geom ? {type:'Feature',geometry:s.geom} : emptyFC);
+}
+</script>
+</body>
+</html>
